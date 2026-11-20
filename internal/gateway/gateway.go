@@ -8771,7 +8771,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			// thinkingConfig can, and loses minimal and xhigh
 			fctx = provider.WithEffort(ctx, req.Effort)
 		}
-		res, err := s.forward(fctx, p, to, path, p.Prepare(body), in)
+		res, err := s.forwardRemoteMessages(fctx, p, to, path, p.Prepare(body), in)
 		if err != nil || res.StatusCode < 400 {
 			if dropped && err == nil {
 				// it was the key: not sent there again
@@ -9694,6 +9694,9 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 		// Claude Code asks again with every tool declared, so a tool it
 		// loads doesn't change the prompt's start (deferred_route.go)
 		return writeError(w, from, 400, deferredRefusal), deferredRefusal
+	}
+	if from == provider.Anthropic && p.IsRemoteMagpie() {
+		r = r.WithContext(context.WithValue(r.Context(), remoteMessagesScope{}, prevScope(r)))
 	}
 	stream := request.Stream
 	request.Stream = true

@@ -75,12 +75,15 @@ type remoteSent struct {
 	key    string // route and scope
 	input  []itemSum
 	output []itemMark
-	id     string // the other magpie's id for the reply
+	replay []itemSum // exact translated output, apart from response-only metadata
+	id     string    // the other magpie's id for the reply
 	at     time.Time
 	el     *list.Element
 }
 
-func (t *remoteSent) size() int { return len(t.input)*sha256.Size + len(t.output)*64 + len(t.id) }
+func (t *remoteSent) size() int {
+	return (len(t.input)+len(t.replay))*sha256.Size + len(t.output)*64 + len(t.id)
+}
 
 type remoteSentStore struct {
 	mu      sync.Mutex
@@ -114,7 +117,15 @@ func (s *remoteSentStore) match(route, key string, sums []itemSum, items []json.
 			continue
 		}
 		c := len(t.input) + len(t.output)
-		if c >= len(items) || c <= n || !sumsEqual(sums[:len(t.input)], t.input) || !marksMatch(t.output, items[len(t.input):c]) {
+		if c >= len(items) || c <= n || !sumsEqual(sums[:len(t.input)], t.input) {
+			continue
+		}
+		if t.replay != nil {
+			replay, ok := remoteReplaySums(items[len(t.input):c])
+			if !ok || !sumsEqual(t.replay, replay) {
+				continue
+			}
+		} else if !marksMatch(t.output, items[len(t.input):c]) {
 			continue
 		}
 		best, n = t, c
@@ -226,6 +237,8 @@ type remoteTurn struct {
 	key, route string
 	sums       []itemSum
 	from       *remoteSent
+	ctx        context.Context
+	strict     bool // a translated Messages replay must match text and arguments
 }
 
 type keepTurnKey struct{}
@@ -234,6 +247,10 @@ type keepTurnKey struct{}
 // whose body names a previous response itself or whose input isn't a
 // list of items: those go as they are, and aren't asked kept.
 func remoteTurnFor(r *http.Request, p provider.Provider, body []byte) *remoteTurn {
+	return remoteTurnForScope(p, body, prevScope(r))
+}
+
+func remoteTurnForScope(p provider.Provider, body []byte, scope string) *remoteTurn {
 	if !p.IsRemoteMagpie() {
 		return nil
 	}
@@ -249,7 +266,7 @@ func remoteTurnFor(r *http.Request, p provider.Provider, body []byte) *remoteTur
 		return nil
 	}
 	route := prevRoute(p)
-	t := &remoteTurn{key: route + "\x00" + prevScope(r), route: route, sums: make([]itemSum, len(items))}
+	t := &remoteTurn{key: route + "\x00" + scope, route: route, sums: make([]itemSum, len(items))}
 	for i, it := range items {
 		t.sums[i] = sha256.Sum256(it)
 	}
@@ -308,11 +325,14 @@ func (t *remoteTurn) tee(rc io.ReadCloser, ctype string) (io.ReadCloser, func())
 		defer sp.discard()
 		tr.mu.Lock()
 		defer tr.mu.Unlock()
-		if sp.cut() {
+		if sp.cut() || tr.err != nil || t.ctx != nil && t.ctx.Err() != nil {
 			return
 		}
 		reply, err := sp.read()
 		if err != nil || len(reply) == 0 {
+			return
+		}
+		if t.strict && !tr.eof && !remoteSSECompleted(tr.ctype, reply) {
 			return
 		}
 		id, output, ok := prevReply(tr.ctype, reply)
@@ -323,6 +343,12 @@ func (t *remoteTurn) tee(rc io.ReadCloser, ctype string) (io.ReadCloser, func())
 		for i, it := range output {
 			kept.output[i] = markOf(it)
 		}
+		if t.strict {
+			kept.replay, ok = remoteReplaySums(output)
+			if !ok {
+				return
+			}
+		}
 		remoteTurns.put(kept, t.from)
 	}
 }
@@ -332,12 +358,19 @@ type teeBody struct {
 	mu    sync.Mutex
 	sp    *spool
 	ctype string
+	eof   bool
+	err   error
 }
 
 func (b *teeBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.mu.Lock()
 	b.sp.add(p[:n])
+	if err == io.EOF {
+		b.eof = true
+	} else if err != nil {
+		b.err = err
+	}
 	b.mu.Unlock()
 	return n, err
 }

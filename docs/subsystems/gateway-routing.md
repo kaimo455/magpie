@@ -3402,7 +3402,11 @@ one in the US, each the other's provider) sent the leg between them the
 whole conversation every turn. Codex says `store: false`, so
 `prevResponses` and `prevDelta` don't apply.
 [`remote_delta.go`](../../internal/gateway/remote_delta.go) handles it in
-`passthrough`, after `prevDelta` and only on Responses.
+`passthrough`, after `prevDelta` and only on Responses. Messages requests
+translated locally to a remote magpie's Responses API use the same kept-turn
+negotiation in [`remote_messages_delta.go`](../../internal/gateway/remote_messages_delta.go).
+Routing must already choose Responses; this does not change Auto's protocol
+choice or enable native Messages threads.
 
 - A Responses request to a remote magpie (`IsRemoteMagpie`) whose body
   names no previous response and whose input is a list of items asks the
@@ -3434,6 +3438,26 @@ whole conversation every turn. Codex says `store: false`, so
   answer in place of the reply, a request naming its own previous
   response, or a magpie that never said it keeps turns (one from before
   this).
+- Locally translated Messages use `forwardRemoteMessages` for both streaming
+  and non-streaming clients, after the Responses body has been built. They
+  share `remoteTurns` and its limits, but have a separate namespace containing
+  the remote endpoint and requested model, plus the original caller's
+  `prevScope`. They never match a native Responses entry.
+- A translated entry also hashes the previous output's content: text, call
+  ids, function names, argument values and sealed reasoning must match the
+  client's replay. Only response message/function ids and status, the known
+  `commentary`/`final_answer` phases that Messages cannot carry, empty
+  annotations/logprobs, and JSON argument formatting are normalized. The
+  remote keeps its original output, including its phase. An edited answer
+  or tool argument goes whole rather than silently substituting the remote's
+  cached answer. Unknown output, nonempty annotations and summary-only
+  reasoning that cannot survive a Messages round trip also go whole.
+- The translated reply is captured as it is read, without waiting for the
+  whole reply before streaming to the client. Only an acknowledged reply
+  with a valid terminal response can be retained when its body closes. The
+  reader must reach EOF or, for SSE, a complete `response.completed` event
+  (where the translator can stop reading). A read error or a cancelled
+  request discards the turn.
 - A delta the other magpie refuses (`prevRefused`: it restarted, or let
   the turn go under its cap) is sent again whole at once and its record is
   dropped. That route's older acknowledgments are held for 30 minutes
@@ -3441,10 +3465,12 @@ whole conversation every turn. Codex says `store: false`, so
   A completed, acknowledged reply kept after the refusal can supply a delta
   immediately: rebuilding a conversation does not leave it sending full
   history for the rest of that interval.
-- Not covered: the reply's output is matched by type and ids only, so a
-  client that edits the text of the last answer (no ids) is sent a delta
-  over the answer the other magpie kept. Tools and instructions still go
-  every turn. The other magpie's kept turns are in memory only.
+- Not covered: native Responses output is still matched by type and ids
+  only, so a native client that edits the text of the last answer (no ids)
+  is sent a delta over the answer the other magpie kept. Tools and
+  instructions still go every turn. The other magpie's kept turns are in
+  memory only. This reduces uploads between magpies, not necessarily from
+  the remote magpie to its vendor.
 
 ### Bodies to another magpie, against the one before
 
@@ -3580,7 +3606,7 @@ go test -tags nogui ./internal/gateway -run 'TestPlain403|TestOrderedKeepsAnAcco
 go test -tags nogui ./internal/gateway -run 'TestVertex'
 go test -tags nogui ./internal/gateway -run 'TestWeightedKeys|TestAccountWeightSharesRequests'
 node --test internal/gui/tests/key-weight.test.cjs internal/gui/tests/account-weight.test.cjs internal/gui/tests/routing-weight-chip.test.cjs
-go test -tags nogui ./internal/gateway -run 'TestPreviousResponse|TestUnknownPreviousResponse|TestPrevStore|TestRemoteMagpieSentTheNewInputAfterAKeptTurn|TestRemoteMagpieLostTurnSentWhole|TestOlderRemoteMagpieSentWhole|TestRemoteMagpieEditedHistorySentWhole|TestKeepTurnOnlyFromAMagpie'
+go test -tags nogui ./internal/gateway -run 'TestPreviousResponse|TestUnknownPreviousResponse|TestPrevStore|TestRemoteMessages|TestRemoteMagpieSentTheNewInputAfterAKeptTurn|TestRemoteMagpieLostTurnSentWhole|TestOlderRemoteMagpieSentWhole|TestRemoteMagpieEditedHistorySentWhole|TestKeepTurnOnlyFromAMagpie'
 go test -tags nogui ./internal/gateway -run 'TestBedrock'
 go test -tags nogui ./internal/gateway -run 'TestPublicAddr|TestEditImageURL|TestPrivateDialer|TestFetchPrivateEntries|TestVendorImageURLAtPrivateAddress|TestVideoContentAtPrivateAddress'
 go test -tags nogui ./internal/gateway ./internal/provider ./internal/cli ./internal/gui -run 'TestDisabled|TestModelDisableCmd'
