@@ -3435,8 +3435,12 @@ whole conversation every turn. Codex says `store: false`, so
   response, or a magpie that never said it keeps turns (one from before
   this).
 - A delta the other magpie refuses (`prevRefused`: it restarted, or let
-  the turn go under its cap) is sent again whole at once, the record is
-  dropped, and that route goes whole for 30 minutes (`remoteRefusedWait`).
+  the turn go under its cap) is sent again whole at once and its record is
+  dropped. That route's older acknowledgments are held for 30 minutes
+  (`remoteRefusedWait`), so another conversation's stale id is not tried.
+  A completed, acknowledged reply kept after the refusal can supply a delta
+  immediately: rebuilding a conversation does not leave it sending full
+  history for the rest of that interval.
 - Not covered: the reply's output is matched by type and ids only, so a
   client that edits the text of the last answer (no ids) is sent a delta
   over the answer the other magpie kept. Tools and instructions still go

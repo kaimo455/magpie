@@ -33,9 +33,10 @@ import (
 // items after them with previous_response_id, store as it was. Anything
 // else goes whole: another history, an edited one, a request that names
 // a previous response itself, a magpie that never said it keeps turns
-// (one from before this), or a route whose magpie refused the id within
-// remoteRefusedWait (it lost it to a restart, or let it go under its own
-// cap), as prevRefused finds it.
+// (one from before this), or a turn acknowledged before that route's
+// magpie refused an id within remoteRefusedWait (it lost it to a restart,
+// or let it go under its own cap), as prevRefused finds it. A turn kept
+// anew after the refusal can supply a delta at once.
 //
 // The other magpie keeps the turn under prevScope, in prevResponses,
 // bounded by prevCap and prevTTL like any other. It takes the header only
@@ -55,8 +56,8 @@ const (
 	KeepTurnHeader = "X-Magpie-Keep-Turn"
 	// KeptTurnHeader on a magpie's reply says it kept the turn when asked
 	KeptTurnHeader = "X-Magpie-Kept-Turn"
-	// remoteRefusedWait is how long a route whose magpie refused the id
-	// is sent whole before a delta is tried again
+	// remoteRefusedWait holds older acknowledgments after a lost id;
+	// a newly acknowledged turn can supply a delta without waiting
 	remoteRefusedWait = 30 * time.Minute
 	// remoteSentCap bounds the bytes of what is kept of turns sent
 	remoteSentCap = 32 << 20
@@ -96,14 +97,20 @@ func newRemoteSentStore() *remoteSentStore {
 	return &remoteSentStore{m: map[string][]*remoteSent{}, refused: map[string]time.Time{}, now: time.Now}
 }
 
-// match is the newest turn kept under key that items continue: its input
-// digests the first items' own, then items of its output's types and ids,
-// and at least one item after them. n is how many items it covers.
-func (s *remoteSentStore) match(key string, sums []itemSum, items []json.RawMessage) (best *remoteSent, n int) {
+// match is the longest usable turn kept under key that items continue:
+// its input digests the first items' own, then items of its output's types
+// and ids, and at least one item after them. n is how many items it covers.
+func (s *remoteSentStore) match(route, key string, sums []itemSum, items []json.RawMessage) (best *remoteSent, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.now()
+	refusedAt, refused := s.refused[route]
+	if refused && now.Sub(refusedAt) > remoteRefusedWait {
+		delete(s.refused, route)
+		refused = false
+	}
 	for _, t := range s.m[key] {
-		if s.now().Sub(t.at) > prevTTL {
+		if now.Sub(t.at) > prevTTL || refused && !t.at.After(refusedAt) {
 			continue
 		}
 		c := len(t.input) + len(t.output)
@@ -179,17 +186,6 @@ func (s *remoteSentStore) refuse(route string) {
 	s.refused[route] = s.now()
 }
 
-func (s *remoteSentStore) waiting(route string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	at, ok := s.refused[route]
-	if ok && s.now().Sub(at) > remoteRefusedWait {
-		delete(s.refused, route)
-		return false
-	}
-	return ok
-}
-
 func sumsEqual(a, b []itemSum) bool {
 	if len(a) != len(b) {
 		return false
@@ -261,16 +257,13 @@ func remoteTurnFor(r *http.Request, p provider.Provider, body []byte) *remoteTur
 }
 
 // delta is body with the input after the turn it continues alone, and
-// that turn's id, when one is kept and its route hasn't refused lately.
+// that turn's id, when its acknowledgment is still usable.
 func (t *remoteTurn) delta(body []byte) ([]byte, bool) {
-	if remoteTurns.waiting(t.route) {
-		return body, false
-	}
 	items, ok := inputList(json.RawMessage(gjson.GetBytes(body, "input").Raw))
 	if !ok || len(items) != len(t.sums) {
 		return body, false
 	}
-	from, n := remoteTurns.match(t.key, t.sums, items)
+	from, n := remoteTurns.match(t.route, t.key, t.sums, items)
 	if from == nil {
 		return body, false
 	}
@@ -296,8 +289,8 @@ func (t *remoteTurn) delta(body []byte) ([]byte, bool) {
 	return nb, true
 }
 
-// refused notes that the route's magpie didn't hold the id: the turn is
-// forgotten, and the route sent whole for remoteRefusedWait.
+// refused forgets the lost turn and holds older route acknowledgments
+// for remoteRefusedWait. A newly kept turn can be continued immediately.
 func (t *remoteTurn) refused() {
 	if t.from != nil {
 		remoteTurns.forget(t.from)
