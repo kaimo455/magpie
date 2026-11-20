@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/provider"
 )
@@ -185,21 +186,20 @@ func TestRemoteMagpieSentTheNewInputAfterAKeptTurn(t *testing.T) {
 	}
 }
 
-// fakeRemote is a server answering as a magpie would on /v1/responses:
-// keeps says it kept the turn, and lost answers every
-// previous_response_id previous_response_not_found.
+// fakeRemote answers as a magpie would on /v1/responses: keeps says it
+// kept the turn, and lost forgets the first reply as a restart would.
 func fakeRemote(t *testing.T, keeps, lost bool) (*hopLog, http.Handler) {
 	t.Helper()
 	freshRemoteTurns(t)
 	hop := &hopLog{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b := hop.add(r)
+		hop.add(r)
 		n := hop.n()
 		w.Header().Set("Content-Type", "application/json")
 		if keeps && r.Header.Get(KeepTurnHeader) != "" {
 			w.Header().Set(KeptTurnHeader, "1")
 		}
-		if lost && strings.Contains(string(b), "previous_response_id") {
+		if lost && hop.body(n - 1)["previous_response_id"] == "resp_r1" {
 			w.WriteHeader(400)
 			io.WriteString(w, `{"error":{"message":"Previous response with id 'resp_r1' not found.","type":"invalid_request_error","param":"previous_response_id","code":"previous_response_not_found"}}`)
 			return
@@ -216,10 +216,8 @@ func fakeRemote(t *testing.T, keeps, lost bool) (*hopLog, http.Handler) {
 	return hop, New().Handler()
 }
 
-// A magpie that said it kept the turn but no longer holds it (restarted)
-// answers previous_response_not_found: the conversation goes again whole
-// at once, and the next turn isn't tried as a delta, which would cost a
-// failed round trip each turn.
+// A magpie that restarted loses the first reply. Once the full retry
+// succeeds and is acknowledged, the next turn continues that new reply.
 func TestRemoteMagpieLostTurnSentWhole(t *testing.T) {
 	hop, h := fakeRemote(t, true, true)
 	const ua = "codex_cli_rs/0.50.0"
@@ -238,8 +236,83 @@ func TestRemoteMagpieLostTurnSentWhole(t *testing.T) {
 	if rec.Code != 200 || hop.n() != 4 {
 		t.Fatalf("turn 3: %d, %d asks", rec.Code, hop.n())
 	}
-	if q := hop.body(3); q["previous_response_id"] != nil || !strings.Contains(hop.raw(3), "QUFB") {
-		t.Fatalf("turn 3 tried as a delta after a refusal: %.300s", hop.raw(3))
+	if q := hop.body(3); q["previous_response_id"] != "resp_r3" || strings.Contains(hop.raw(3), "QUFB") {
+		t.Fatalf("turn 3 did not continue the newly kept reply: %.300s", hop.raw(3))
+	}
+}
+
+// A replay can match a longer branch kept before the receiver restarted
+// and a shorter one kept anew. Only the usable acknowledgment may win,
+// while another conversation's pre-refusal acknowledgment stays held.
+func TestRemoteMagpieNewTurnBeforeStaleLongerHistory(t *testing.T) {
+	freshRemoteTurns(t)
+	now := time.Unix(100, 0)
+	remoteTurns.now = func() time.Time { return now }
+	p := provider.Provider{ID: "office", Preset: provider.RemoteMagpiePreset, Key: "rk"}
+	body := []byte(storeFalseTurn(
+		"m1",
+		userAsks("first question"),
+		userSaw("first answer"),
+		userAsks("second question"),
+		userSaw("second answer"),
+		userAsks("third question"),
+	))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	turn := remoteTurnFor(req, p, body)
+	if turn == nil {
+		t.Fatal("remote turn was not recognized")
+	}
+	otherBody := []byte(storeFalseTurn(
+		"m1",
+		userAsks("other question"),
+		userSaw("other answer"),
+		userAsks("other follow-up"),
+	))
+	otherTurn := remoteTurnFor(req, p, otherBody)
+	if otherTurn == nil {
+		t.Fatal("other remote turn was not recognized")
+	}
+	remoteTurns.put(
+		&remoteSent{
+			key:    turn.key,
+			input:  turn.sums[:3],
+			output: []itemMark{markOf([]byte(userSaw("second answer")))},
+			id:     "resp_old_branch",
+		},
+		nil,
+	)
+	remoteTurns.put(
+		&remoteSent{
+			key:    otherTurn.key,
+			input:  otherTurn.sums[:1],
+			output: []itemMark{markOf([]byte(userSaw("other answer")))},
+			id:     "resp_other_stale",
+		},
+		nil,
+	)
+	now = now.Add(time.Second)
+	remoteTurns.refuse(turn.route)
+	now = now.Add(time.Second)
+	remoteTurns.put(
+		&remoteSent{
+			key:    turn.key,
+			input:  turn.sums[:1],
+			output: []itemMark{markOf([]byte(userSaw("first answer")))},
+			id:     "resp_new_branch",
+		},
+		nil,
+	)
+	wire, delta := turn.delta(body)
+	var request map[string]any
+	if !delta || json.Unmarshal(wire, &request) != nil || request["previous_response_id"] != "resp_new_branch" {
+		t.Fatal("a stale longer history hid the newly acknowledged response")
+	}
+	input, _ := request["input"].([]any)
+	if len(input) != 3 || strings.Contains(string(wire), "first question") || !strings.Contains(string(wire), "second answer") {
+		t.Fatal("the delta did not carry the input after the usable response")
+	}
+	if _, otherDelta := otherTurn.delta(otherBody); otherDelta {
+		t.Fatal("a second conversation's pre-refusal acknowledgment was not held during remoteRefusedWait")
 	}
 }
 
